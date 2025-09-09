@@ -6,10 +6,7 @@ import software.coley.instrument.data.ServerClassLoaderInfo;
 import software.coley.instrument.message.broadcast.BroadcastClassMessage;
 import software.coley.instrument.message.broadcast.BroadcastClassloaderMessage;
 import software.coley.instrument.util.Logger;
-import software.coley.instrument.util.Streams;
 
-import java.io.IOException;
-import java.io.InputStream;
 import java.lang.instrument.ClassDefinition;
 import java.lang.instrument.ClassFileTransformer;
 import java.lang.instrument.Instrumentation;
@@ -24,6 +21,7 @@ import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReentrantLock;
+import java.util.function.Function;
 import java.util.stream.Collectors;
 
 /**
@@ -101,26 +99,89 @@ public final class InstrumentationHelper implements ClassFileTransformer {
 	 * Call {@link LoaderData#update(String, Class, byte[])} with existing classes from
 	 * {@link Instrumentation#getAllLoadedClasses()}.
 	 */
-	private void populateExisting() {
-		for (Class<?> cls : instrumentation.getAllLoadedClasses()) {
-			if (isSelf(cls.getProtectionDomain()))
-				continue;
-			String name = cls.getName().replace('.', '/');
-			InputStream clsStream = ClassLoader.getSystemResourceAsStream(name + ".class");
-			if (clsStream != null) {
-				ClassLoader loader = cls.getClassLoader();
-				if (isBlacklisted(loader))
-					continue;
-				try {
-					byte[] code = Streams.readStream(clsStream);
-					getOrCreateDataWrapper(loader)
-							.update(name, cls, code);
-				} catch (IOException e) {
-					Logger.debug("Failed to read existing class: " + name);
-				}
-			}
-		}
-	}
+    private void populateExisting() {
+        HashSet<Class<?>> allClasses = new HashSet<>();
+        for (Class<?> cls : instrumentation.getAllLoadedClasses()) {
+            ClassLoader classLoader = cls.getClassLoader();
+            String clsName = cls.getName();
+            if (classLoader == null) {
+                // TODO: Maybe there is a way to not exclude BootstrapClassloader,
+                //  some agents load classes with BootstrapClassloader
+                Logger.debug("ignore bootstrap classloader: " + clsName);
+                continue;
+            }
+            if (isSelf(cls.getProtectionDomain())) {
+                Logger.debug("ignore class self of agent: " + clsName);
+                continue;
+            }
+            if (isBlacklisted(classLoader)) {
+                Logger.debug("ignore class with loader in blacklist: " + clsName);
+                continue;
+            }
+            if (clsName.contains("$$Lambda")) {
+                // because jdk do not support retransform lambda class: https://github.com/alibaba/arthas/issues/1512.
+                Logger.debug("ignore lambda class: " + clsName);
+                continue;
+            }
+            if (clsName.startsWith("[")) {
+                Logger.debug("ignore array class: " + clsName);
+                continue;
+            }
+            if (clsName.startsWith("java.lang.invoke")) {
+                Logger.debug("ignore reflect class: " + clsName);
+                continue;
+            }
+            allClasses.add(cls);
+        }
+        // DEBUG : retransformClassesDebug(allClasses);
+        retransformClasses(allClasses);
+    }
+
+    /**
+     * @param classes All class which will be retransformed without error
+     */
+    public void retransformClasses(Set<Class<?>> classes) {
+        Function<ClassLoader, LoaderData> function = this::getOrCreateDataWrapper;
+        DumpClassFileTransformer transformer = new DumpClassFileTransformer(function);
+        try {
+            instrumentation.addTransformer(transformer, true);
+            Logger.debug("Retransforming classes: " + classes.size());
+            try {
+                instrumentation.retransformClasses(classes.toArray(new Class[0]));
+            } catch (Throwable e) {
+                Logger.error("Retransform Classes class error, msg: " + e.getMessage());
+            }
+        } finally {
+            instrumentation.removeTransformer(transformer);
+        }
+    }
+
+    /**
+     * This method is used to find which class make something wrong!!!
+     *
+     * @param classes All class which will be retransformed without error
+     */
+    public void retransformClassesDebug(Set<Class<?>> classes) {
+        Function<ClassLoader, LoaderData> function = this::getOrCreateDataWrapper;
+        DumpClassFileTransformer transformer = new DumpClassFileTransformer(function);
+        try {
+            instrumentation.addTransformer(transformer, true);
+            Logger.debug("Retransforming classes: " + classes.size());
+            for (Class<?> clazz : classes) {
+                try {
+                    Logger.debug("Retransforming class: " + clazz.getName() + ", loader hash: " +
+                            clazz.getClassLoader().hashCode());
+                    instrumentation.retransformClasses(clazz);
+                } catch (Throwable e) {
+                    Logger.error("Retransform class error, msg: " + e.getMessage() +
+                            ", class: " + clazz.getName() + ", loader hash: " +
+                            (clazz.getClassLoader() != null ? clazz.getClassLoader().hashCode() : null));
+                }
+            }
+        } finally {
+            instrumentation.removeTransformer(transformer);
+        }
+    }
 
 	/**
 	 * @return All loaders.
@@ -273,4 +334,20 @@ public final class InstrumentationHelper implements ClassFileTransformer {
 			}
 		}
 	}
+
+    public static class DumpClassFileTransformer implements ClassFileTransformer {
+        private final Function<ClassLoader, LoaderData> function;
+
+        DumpClassFileTransformer(Function<ClassLoader, LoaderData> function) {
+            this.function = function;
+        }
+
+        @Override
+        public byte[] transform(ClassLoader loader, String className, Class<?> classBeingRedefined,
+                                ProtectionDomain protectionDomain, byte[] classfileBuffer) {
+            Logger.info("Dumping class: " + className + ",loader hash: " + loader.hashCode());
+            function.apply(loader).update(className, classBeingRedefined, classfileBuffer);
+            return classfileBuffer;
+        }
+    }
 }
