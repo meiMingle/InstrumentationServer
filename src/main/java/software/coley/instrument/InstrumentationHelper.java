@@ -5,6 +5,7 @@ import software.coley.instrument.data.ClassData;
 import software.coley.instrument.data.ServerClassLoaderInfo;
 import software.coley.instrument.message.broadcast.BroadcastClassMessage;
 import software.coley.instrument.message.broadcast.BroadcastClassloaderMessage;
+import software.coley.instrument.util.JavaVersion;
 import software.coley.instrument.util.Logger;
 
 import java.lang.instrument.ClassDefinition;
@@ -128,10 +129,36 @@ public final class InstrumentationHelper implements ClassFileTransformer {
                 Logger.debug("Ignore array class: " + clsName);
                 continue;
             }
+            if (JavaVersion.getMajorVersion() >= 13 && maybeInvalidClass(clsName)) {
+                Logger.debug("Ignore potentially invalid class: " + clsName);
+                continue;
+            }
+            if (JavaVersion.getMajorVersion() >= 11 && !instrumentation.isModifiableClass(cls)) {
+                Logger.debug("Ignore unmodifiable class: " + clsName);
+                continue;
+            }
             allClasses.add(cls);
         }
         // DEBUG : retransformClassesDebug(allClasses);
         retransformClasses(allClasses);
+    }
+
+    private boolean maybeInvalidClass(String clsName) {
+        switch (clsName) {
+            case "org.springframework.transaction.interceptor.TransactionAspectSupport$ReactiveTransactionSupport":
+            case "org.springframework.boot.autoconfigure.cache.InfinispanCacheConfiguration":
+            case "org.springframework.http.codec.multipart.DefaultPartHttpMessageReader":
+            case "org.springframework.boot.logging.log4j2.Log4J2LoggingSystem":
+            case "org.springframework.web.multipart.commons.CommonsMultipartResolver":
+            case "org.springframework.boot.autoconfigure.cache.RedisCacheConfiguration":
+            case "groovy.grape.GrapeIvy":
+            case "org.mariadb.jdbc.client.socket.impl.UnixDomainSocket":
+            case "org.springframework.web.multipart.commons.CommonsFileUploadSupport":
+            case "org.springframework.transaction.reactive.TransactionalOperator":
+                return true;
+            default:
+                return false;
+        }
     }
 
     /**
